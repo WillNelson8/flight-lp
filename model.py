@@ -243,3 +243,44 @@ def dual_labels(result: SolveResult) -> dict[str, float]:
     """Cost-to-reach implied by the LP duals: pi_C1 + pi_node. Equals the shortest-path label on the optimal path."""
     start = result.duals.get("C1_start_MIA", 0.0)
     return {name.removeprefix("C3_bal_"): start + pi for name, pi in result.duals.items() if name.startswith("C3_bal_")}
+
+
+def load_flights(run_dir: Path) -> list[Flight]:
+    import snapshot
+    from network import flight_from_row
+    return [flight_from_row(r) for r in snapshot.read_rows(run_dir / "flights.csv")]
+
+
+def main() -> None:
+    import argparse
+    import snapshot
+    from network import build_network
+
+    parser = argparse.ArgumentParser(description="Solve all four scenarios on the latest scrape and print a report.")
+    parser.add_argument("--k", type=int, default=5)
+    parser.add_argument("--mct", type=int, default=45)
+    parser.add_argument("--partial", action="store_true", help="allow an unfinished run (for development)")
+    args = parser.parse_args()
+    run_dir = snapshot.latest_run() or (snapshot.latest_run(complete=False) if args.partial else None)
+    if run_dir is None:
+        raise SystemExit("No complete scrape found. Run `python fetch.py` first (or pass --partial).")
+    net = build_network(load_flights(run_dir), args.mct)
+    out = Path(__file__).parent / "out"
+    out.mkdir(exist_ok=True)
+    print(f"Run {run_dir.name}: {len(net.flights)} flights, {len(net.nodes)} nodes, {len(net.waits)} wait arcs, MCT {args.mct} min")
+    for s in SCENARIOS:
+        r = solve(net, s, args.k)
+        (out / f"{s.key}.lp").write_text(r.lp_text)
+        print(f"\n{s.key} {s.label}: {r.n_variables} variables, {r.n_constraints} constraints")
+        if r.status != "optimal":
+            print("  No feasible itinerary")
+            continue
+        check = "match" if abs(r.lp_objective - r.shortest_path_cost) < 1e-6 else "MISMATCH"
+        print(f"  integrality check: {'pass' if r.integral else 'FAIL'}; networkx cross-check: {check}")
+        for it in r.itineraries:
+            legs = ", ".join(f"{f.flight_number} {f.origin}-{f.dest} {f.dep:%H:%M}-{f.arr:%H:%M} ${f.price}" for f in it.flights)
+            print(f"  #{it.rank} ${it.cost} ({it.method}): {legs}")
+
+
+if __name__ == "__main__":
+    main()

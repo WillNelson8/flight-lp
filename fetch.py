@@ -4,14 +4,19 @@ Usage:
     python fetch.py          start a new run, or resume the latest unfinished one
     python fetch.py --new    force a new run
 """
+import argparse
 import json
+import random
+import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from selectolax.lexbor import LexborHTMLParser
 
-from airports import AIRPORTS, TRIP_DATE
+import snapshot
+from airports import AIRPORTS, DEST, ORIGIN, TRIP_DATE, search_routes
 
 TRIP_DAY = tuple(int(p) for p in TRIP_DATE.split("-"))
 
@@ -114,3 +119,98 @@ def cheapest_itinerary(itineraries: list[dict]) -> dict | None:
             "arr_local": "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}".format(*l["arr_date"], *l["arr_time"]),
         } for l in best["legs"]],
     }
+
+
+def build_query(origin: str, dest: str, max_stops: int | None, airlines: list[str] | None = None,
+                single_ticket: bool = False):
+    from fast_flights import FlightQuery, Passengers, create_query
+    return create_query(
+        flights=[FlightQuery(date=TRIP_DATE, from_airport=origin, to_airport=dest,
+                             max_stops=max_stops, airlines=airlines)],
+        seat="economy", trip="one-way", passengers=Passengers(adults=1),
+        language="en-US", currency="USD", hide_separate_and_self_transfer=single_ticket,
+    )
+
+
+def google_fetch(query) -> str:
+    from fast_flights import fetch_flights_html
+    return fetch_flights_html(query)
+
+
+def _attempt(fetch_html, query, label, log) -> list[dict] | None:
+    try:
+        itineraries = parse_payload(fetch_html(query))
+    except Exception as exc:  # network errors count as failures, like block pages
+        log(f"{label}: error {exc!r}")
+        return None
+    if itineraries is None:
+        log(f"{label}: no result payload (blocked or CAPTCHA page)")
+    return itineraries
+
+
+def run(run_dir: Path, fetch_html=google_fetch, sleep=time.sleep, pause=(2.0, 4.0), max_failures=5, log=print) -> bool:
+    """Scrape everything not yet done in run_dir. Returns True once the run is complete."""
+    failures = 0
+    ref_path = run_dir / "reference.json"
+    if not ref_path.exists():
+        reference = {}
+        for key, airlines in (("all", None), ("american", ["AA"])):
+            its = _attempt(fetch_html, build_query(ORIGIN, DEST, None, airlines, single_ticket=True), f"reference {key}", log)
+            sleep(random.uniform(*pause))
+            if its is None:
+                failures += 1
+                break
+            reference[key] = cheapest_itinerary(its)
+        else:
+            ref_path.write_text(json.dumps(reference, indent=2))
+
+    status = snapshot.route_status(run_dir)
+    todo = [r for r in search_routes() if status.get(r) not in ("ok", "no_service")]
+    for i, (o, d) in enumerate(todo, 1):
+        if failures >= max_failures:
+            break
+        scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        its = _attempt(fetch_html, build_query(o, d, 0), f"{o}-{d}", log)
+        if its is None:
+            failures += 1
+            snapshot.append_rows(run_dir / "routes.csv", snapshot.ROUTE_COLUMNS,
+                                 [{"origin": o, "dest": d, "status": "failed", "n_flights": 0, "scraped_at": scraped_at}])
+        else:
+            failures = 0
+            rows, drops = nonstop_rows(its, o, d, scraped_at)
+            snapshot.append_rows(run_dir / "flights.csv", snapshot.FLIGHT_COLUMNS, rows)
+            snapshot.append_rows(run_dir / "drops.csv", snapshot.DROP_COLUMNS,
+                                 [{"origin": o, "dest": d, "reason": r, "count": c} for r, c in drops.items()])
+            state = "ok" if rows else "no_service"
+            snapshot.append_rows(run_dir / "routes.csv", snapshot.ROUTE_COLUMNS,
+                                 [{"origin": o, "dest": d, "status": state, "n_flights": len(rows), "scraped_at": scraped_at}])
+            log(f"[{i}/{len(todo)}] {o}-{d}: {state} ({len(rows)} flights)")
+        sleep(random.uniform(*pause))
+
+    status = snapshot.route_status(run_dir)
+    remaining = [r for r in search_routes() if status.get(r) not in ("ok", "no_service")]
+    if failures >= max_failures:
+        log(f"Stopped after {failures} consecutive failures. Progress is saved; run `python fetch.py` later to resume.")
+    if remaining or not ref_path.exists():
+        log(f"{len(remaining)} routes still to do. Run `python fetch.py` again to resume.")
+        return False
+    snapshot.mark_complete(run_dir)
+    log(f"Run complete: {run_dir}")
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--new", action="store_true", help="start a new run even if one is unfinished")
+    args = parser.parse_args()
+    run_dir = None if args.new else snapshot.latest_run(complete=False)
+    if run_dir is None:
+        run_dir = snapshot.new_run_dir(datetime.now().strftime("%Y-%m-%d_%H%M"))
+        print(f"New run: {run_dir}", flush=True)
+    else:
+        print(f"Resuming: {run_dir}", flush=True)
+    run(run_dir, log=lambda m: print(m, flush=True))
+
+
+if __name__ == "__main__":
+    main()

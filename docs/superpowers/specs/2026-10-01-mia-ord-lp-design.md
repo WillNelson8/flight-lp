@@ -49,7 +49,14 @@ The 20 intermediate airports, a mix of hubs and mid-size airports (editable as o
 
 ### 5.1 Source
 
-Google Flights, queried through the `fast-flights` Python library (3.x, no API key). Backup: a Playwright headless-browser scraper that writes the same output format, used only if `fast-flights` stops working. Before writing the parser, implementation inspects the installed `fast-flights` version's actual call signatures and result fields; the spec does not assume field names.
+Google Flights, queried through the `fast-flights` Python library (3.1.0, no API key). Backup: a Playwright headless-browser scraper that writes the same output format, used only if `fast-flights` stops working.
+
+Verified on 2026-10-01 against real responses: the library's own parser (`get_flights`) reads only Google's "other flights" list and drops the "best flights" list and flight numbers (MIA to ORD nonstop: it returned 10 of 13 flights). So `fetch.py` uses `fast_flights.create_query` and `fast_flights.fetch_flights_html` to build and send the request, and parses Google's embedded result payload (the `script.ds:1` block) itself, reading both lists. Facts confirmed from real payloads:
+
+- Result lists live at `payload[2][0]` (best) and `payload[3][0]` (other); both are `null` when a route has no nonstop service.
+- Per itinerary: `k[1][0][1]` is the price in whole US dollars; `k[0][2]` is the list of legs.
+- Per leg: `[3]` origin code, `[6]` destination code, `[8]` / `[10]` local departure / arrival time as `[hour, minute]` with omitted zero components (`[7]` means 07:00, `[null, 31]` means 00:31), `[20]` / `[21]` local departure / arrival date, `[22]` = `[carrier code, flight number, _, airline name]`, `[17]` aircraft.
+- A response with no `script.ds:1` block is a block or CAPTCHA page and counts as a failure.
 
 ### 5.2 Searches
 
@@ -61,7 +68,7 @@ Every directed pair `(o, d)` with `o` in {MIA} plus the 20 hubs, `d` in the 20 h
 
 Each search keeps **nonstop flights only** (stops = 0), using the library's stops filter if available, otherwise filtering results.
 
-One additional reference search: MIA to ORD with any number of stops, recording Google's cheapest overall itinerary and Google's cheapest American itinerary as **single-ticket reference fares**.
+Two additional reference searches, MIA to ORD with any number of stops and `hide_separate_and_self_transfer=True`: one with all airlines, one with `airlines=["AA"]`. The cheapest itinerary from each is recorded as Google's **single-ticket reference fare** (for example, on 2026-10-01 Google's cheapest was Frontier MIA-ATL-ORD at $163).
 
 ### 5.3 Pacing and resumability
 
@@ -71,23 +78,26 @@ One additional reference search: MIA to ORD with any number of stops, recording 
 
 ### 5.4 Output files (`data/`)
 
-`snapshot_<YYYY-MM-DD_HHMM>.csv`, one row per nonstop flight:
+Each run writes a directory `data/<YYYY-MM-DD_HHMM>/` (path overridable with the `FLIGHT_LP_DATA` environment variable). `flights.csv` has one row per nonstop flight:
 
 | Column | Meaning |
 |---|---|
 | `origin`, `dest` | IATA codes of the searched route |
+| `carrier` | Two-letter marketing carrier code (for example AA, UA, F9) |
 | `airline` | Airline name as Google reports it |
-| `flight_number` | If Google provides it, else empty |
+| `flight_number` | Carrier code plus number, for example `AA 1204` |
 | `dep_local`, `arr_local` | ISO 8601 local times with UTC offset |
 | `price_usd` | Cheapest one-way economy price shown, in whole dollars |
-| `is_american` | True if the airline is American Airlines or American Eagle |
+| `is_american` | True if `carrier == "AA"` (American Eagle regional flights, such as AA 4097 CVG to ORD operated on an Embraer 170, carry code AA, verified) |
 | `scraped_at` | UTC timestamp of that search |
 
-`routes_<YYYY-MM-DD_HHMM>.csv`, one row per searched route: `origin`, `dest`, `status` (`ok`, `no_service`, `failed`), `n_flights`, `scraped_at`.
+`routes.csv`, one row per search attempt (the last row per route wins): `origin`, `dest`, `status` (`ok`, `no_service`, `failed`), `n_flights`, `scraped_at`.
 
-`reference_<YYYY-MM-DD_HHMM>.json`: Google's cheapest single-ticket MIA to ORD itinerary (any airline) and cheapest American itinerary, with legs, times, and price.
+`drops.csv`: validation drop counts per route and reason.
 
-`latest.txt` names the most recent complete snapshot. The solver and dashboard read only these files; they never scrape.
+`reference.json`: Google's cheapest single-ticket MIA to ORD itinerary (any airline) and cheapest American itinerary, with legs, times, and price.
+
+An empty `COMPLETE` file marks a finished run; the newest complete run is the one the solver and dashboard use. The solver and dashboard read only these files; they never scrape.
 
 ### 5.5 Validation
 
@@ -137,7 +147,15 @@ Variables
   w_g  for g in W     1 if waiting on arc g       0 <= w_g <= 1
 
 Objective
-  minimize   sum over f in F of  price_f * x_f
+  minimize   sum over f in F of  (price_f + tie_f) * x_f
+
+  tie_f is a tie-breaker far smaller than $1 (prices are whole dollars):
+    tie_f = 0.00003                                   for every flight (fewer flights wins a tie)
+          + 0.5 * (minutes after 00:00 CT of ORD arrival) / 1440   for f in In(ORD) (earlier arrival wins)
+  One minute of arrival time is worth $0.00035, more than ten extra flights ($0.0003).
+  The total tie term of any itinerary is below $0.51, so it never changes which
+  price is cheapest; it only orders itineraries of equal price. Reported costs
+  are the pure sum of price_f.
 
 Constraints
   C1 Start       sum over f in Out(MIA) of x_f = 1
@@ -146,7 +164,7 @@ Constraints
   C4 Same day    x_f = 0  for each f in In(ORD) arriving after 2026-11-20 23:59 America/Chicago
   C5 Airline     x_f = 0  for each f with is_american = False    (American scenarios only)
   C6 One stop    x_f = 0  for each f not in Out(MIA) and not in In(ORD)   (one-stop scenarios only)
-  C7 Bounds      0 <= x_f <= 1,  0 <= w_g <= 1
+  C7 Bounds      x_f >= 0,  w_g >= 0   (x <= 1 is implied: C1 to C3 move exactly one unit of flow)
 ```
 
 "One day" means: depart MIA on 2026-11-20 local time (guaranteed by the search date) and arrive ORD no later than 23:59 Central on 2026-11-20 (C4). Since time only moves forward, every intermediate leg also falls inside that window.
@@ -155,7 +173,7 @@ C4, C5, and C6 are written into the model as explicit `x_f = 0` rows, rather tha
 
 ### 7.2 Why the LP gives a whole-number answer
 
-With C1 written as a supply of 1 at MIA and C2 as a demand of 1 at ORD, every variable's column has exactly one +1 and one -1 across C1 to C3. That is the incidence matrix of a directed graph, which is totally unimodular. Adding single-variable rows (C4 to C6) and bounds preserves this. So every vertex of the feasible region is 0/1, and the simplex solution is a real itinerary. After every LP solve, the code checks that every variable is within 1e-6 of 0 or 1 and reports the result.
+With C1 written as a supply of 1 at MIA and C2 as a demand of 1 at ORD, every variable's column has exactly one +1 and one -1 across C1 to C3. That is the incidence matrix of a directed graph, which is totally unimodular. Adding single-variable rows (C4 to C6) preserves this. Upper bounds of 1 are not declared because C1 to C3 already imply them; leaving them off keeps every chosen variable basic in the simplex solution, so the duals read cleanly as cost-to-reach labels. So every vertex of the feasible region is 0/1, and the simplex solution is a real itinerary. After every LP solve, the code checks that every variable is within 1e-6 of 0 or 1 and reports the result.
 
 ### 7.3 Scenarios
 
@@ -174,7 +192,7 @@ With C1 written as a supply of 1 at MIA and C2 as a demand of 1 at ORD, every va
 
 The cuts break total unimodularity, so solves 2 through K declare `x` and `w` as binary (an integer program, CBC branch and bound). The dashboard labels solve 1 as "LP" and solves 2 to K as "IP with cuts".
 
-Ranking is purely by total price (the objective). Two itineraries with the same airports but different flights are different itineraries. After collecting K itineraries, ties in price are ordered by earlier ORD arrival, then fewer flights. Which tied itineraries make the top K at the boundary is solver-determined.
+Ranking is by total price (the objective). Two itineraries with the same airports but different flights are different itineraries. Ties in price are broken inside the objective by the tie term (earlier ORD arrival first, then fewer flights), so the ranking is deterministic. Real data has many ties (on 2026-10-01 all 13 MIA-ORD nonstops were $227), so this matters.
 
 K defaults to 5, adjustable 1 to 10. If fewer than K itineraries exist, all that exist are returned.
 
@@ -319,7 +337,7 @@ These are stated on the dashboard's LP tab and in the README.
 - **Prices are a snapshot.** They change constantly. Results are tied to the scrape timestamp.
 - **Airport set.** Only the 22 listed airports are considered. A cheaper route through an unlisted airport would not be found.
 - **Terms of service.** Google Flights' terms do not permit automated scraping. The single low-volume, paced run is for a class project only.
-- **"American".** A flight counts as American if Google lists American Airlines or American Eagle as the airline. The exact matching rule is confirmed against real scraped airline strings during implementation.
+- **"American".** A flight counts as American if its marketing carrier code is AA, which includes American Eagle regional flights.
 
 ## 13. Success criteria
 

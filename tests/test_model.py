@@ -97,3 +97,19 @@ def test_lp_text_and_sizes():
     assert "C1_start_MIA" in r.lp_text and "C2_end_ORD" in r.lp_text
     assert r.n_variables == 4  # 3 flights + 1 wait arc
     assert {c.group for c in r.constraints} == {"C1", "C2", "C3"}
+
+
+def test_price_drop_needed_is_exact_where_lp_reduced_costs_are_degenerate():
+    direct = fl("MIA", "ORD", "08:00", "10:00", 300)
+    a = fl("MIA", "CLT", "07:00", "09:00", 100)
+    b = fl("CLT", "ORD", "10:00", "11:00", 100)
+    dead_end = fl("MIA", "ATL", "07:00", "09:00", 20)  # nothing leaves ATL, so it can never be on a trip
+    r = best([direct, a, b, dead_end])
+    assert r.price_drop[direct.id] == pytest.approx(100, abs=1)
+    assert r.price_drop[dead_end.id] is None
+    assert a.id not in r.price_drop and b.id not in r.price_drop  # chosen flights are not listed
+
+
+def test_constraint_expressions_print_zero_not_negative_zero():
+    r = best([fl("MIA", "CLT", "07:00", "09:00", 100), fl("CLT", "ORD", "10:00", "11:00", 100)])
+    assert not any("-0.0" in c.expression for c in r.constraints)

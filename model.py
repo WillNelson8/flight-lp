@@ -114,6 +114,7 @@ class SolveResult:
     shortest_path_cost: float | None = None
     node_labels: dict[str, float] = field(default_factory=dict)
     reach_cost: dict[str, int] = field(default_factory=dict)
+    price_drop: dict[str, float | None] = field(default_factory=dict)  # unchosen flight -> exact drop to enter; None = no trip uses it
 
 
 def build_problem(net: Network, scenario: Scenario, binary: bool = False, cuts=()):
@@ -174,7 +175,7 @@ def _constraint_rows(prob: pulp.LpProblem) -> list[ConstraintRow]:
     for c in prob.constraints():
         group = "CUT" if c.name.startswith("CUT") else c.name.split("_")[0]
         lhs = sum(coef * (var.value() or 0) for var, coef in c.items())
-        rows.append(ConstraintRow(c.name, group, str(c), lhs))
+        rows.append(ConstraintRow(c.name, group, str(c).replace("= -0.0", "= 0").replace("= 0.0", "= 0"), lhs))
     return rows
 
 
@@ -206,6 +207,27 @@ def _shortest_paths(net: Network, scenario: Scenario) -> tuple[float | None, dic
     return labels.get(DEST), labels, reach
 
 
+def _price_drop(net: Network, scenario: Scenario, forward: dict[str, float], optimum: float,
+                chosen_ids: set[str]) -> dict[str, float | None]:
+    """Exact sensitivity: cheapest full trip through each unchosen flight minus the optimum.
+
+    The LP is degenerate, so simplex reduced costs are often 0 for flights that cannot reach ORD at all;
+    forward labels (MIA to tail) plus backward labels (head to ORD) give the true amount.
+    """
+    backward = nx.single_source_dijkstra_path_length(_graph(net, scenario).reverse(copy=False), DEST, weight="weight")
+    drops = {}
+    for f in net.flights:
+        if f.id in chosen_ids or excluded_reason(f, scenario):
+            continue
+        u = net.tail[f.id].name if net.tail[f.id] else ORIGIN
+        v = net.head[f.id].name if net.head[f.id] else DEST
+        if u not in forward or v not in backward:
+            drops[f.id] = None
+        else:
+            drops[f.id] = forward[u] + f.price + tie_term(f) + backward[v] - optimum
+    return drops
+
+
 def solve(net: Network, scenario: Scenario, k: int = 5) -> SolveResult:
     prob, x, w = build_problem(net, scenario)
     status = _solve(prob)
@@ -227,6 +249,7 @@ def solve(net: Network, scenario: Scenario, k: int = 5) -> SolveResult:
         reduced_costs={f.id: x[f.id].dj for f in allowed if f.id not in chosen_ids},
         constraints=_constraint_rows(prob), **base,
     )
+    result.price_drop = _price_drop(net, scenario, labels, result.lp_objective, chosen_ids)
     for rank in range(2, k + 1):
         cuts = [it.flights for it in result.itineraries]
         ip, x2, _ = build_problem(net, scenario, binary=True, cuts=cuts)

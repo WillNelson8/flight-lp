@@ -200,7 +200,8 @@ K defaults to 5, adjustable 1 to 10. If fewer than K itineraries exist, all that
 
 - **Dual values** of C1 to C3, as reported by CBC.
 - **Shortest-path labels**: the cheapest cost to reach each node, computed independently by networkx. Shown next to the dual values. Where they differ, the table notes that the LP is degenerate at that node and its dual is not unique.
-- **Reduced costs** of flights not chosen: how much the price would need to drop before the flight could enter the solution.
+- **Reduced costs** of flights not chosen, as reported by CBC. Because the LP is degenerate, these are often 0 even for flights that cannot reach ORD, so they are only lower bounds.
+- **Price drop needed** (exact) for each unchosen flight: forward shortest-path label to its tail, plus its price, plus the backward label from its head to ORD, minus the optimum. None when no same-day trip can use the flight.
 
 ### 7.6 Infeasibility
 
@@ -269,7 +270,7 @@ All controls re-solve the model. Results are cached by (scenario, MCT, K).
 
 - Bar chart of the cheapest cost to reach each intermediate airport (minimum shortest-path label across its nodes).
 - Table of dual values next to the shortest-path labels, with degeneracy notes.
-- Table of the 20 non-chosen flights with the smallest reduced costs.
+- Table of the 25 unchosen flights with the smallest exact price drop needed, with the LP reduced cost alongside.
 
 ### 8.7 Tab 4: Data
 

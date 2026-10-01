@@ -72,7 +72,7 @@ def route_map(flights, itineraries, highlight: int | None = None, compare=None) 
     for a, b in pairs:
         lons += [AIRPORTS[a].lon, AIRPORTS[b].lon, None]
         lats += [AIRPORTS[a].lat, AIRPORTS[b].lat, None]
-    fig.add_trace(go.Scattergeo(lon=lons, lat=lats, mode="lines", line=dict(color=CONTEXT, width=1),
+    fig.add_trace(go.Scattergeo(lon=lons, lat=lats, mode="lines", line=dict(color=GRID, width=0.7),
                                 hoverinfo="skip", name="context"))
 
     if compare is not None:
@@ -106,8 +106,9 @@ def route_map(flights, itineraries, highlight: int | None = None, compare=None) 
         ranks = shared[(mid_leg.origin, mid_leg.dest)]
         j = ranks.index(it.rank)
         lo, la = _curve(mid_leg.origin, mid_leg.dest, 0.08 + (j - (len(ranks) - 1) / 2) * 0.12)
+        at = min(27, 8 + 5 * j)  # stagger badges along shared legs so they do not stack
         fig.add_trace(go.Scattergeo(
-            lon=[lo[15]], lat=[la[15]], mode="markers+text", opacity=opacity, name=f"badge {it.rank}",
+            lon=[lo[at]], lat=[la[at]], mode="markers+text", opacity=opacity, name=f"badge {it.rank}",
             marker=dict(size=17, color="white", line=dict(color=rank_color(it.rank), width=1.6)),
             text=[str(it.rank)], textfont=dict(color=INK, size=10, family=FONT["family"]),
             hoverinfo="skip",
@@ -121,9 +122,13 @@ def route_map(flights, itineraries, highlight: int | None = None, compare=None) 
         text=codes, textposition="top center", textfont=dict(size=10, color=INK_2, family=FONT["family"]),
         hovertext=[f"{c} {AIRPORTS[c].city}" for c in codes], hoverinfo="text", name="airports",
     ))
-    fig.update_geos(scope="usa", projection_type="albers usa", fitbounds="locations", showland=True,
-                    landcolor=LAND, subunitcolor="white", countrycolor="white", showlakes=False, bgcolor=SURFACE)
-    return _layout(fig, 520)
+    lats = [a.lat for a in AIRPORTS.values()]
+    lons = [a.lon for a in AIRPORTS.values()]
+    fig.update_geos(scope="north america", projection_type="mercator", showland=True, landcolor=LAND,
+                    showsubunits=True, subunitcolor="white", showcountries=True, countrycolor="white",
+                    showlakes=False, showocean=True, oceancolor=SURFACE, showframe=False, bgcolor=SURFACE,
+                    lataxis_range=[min(lats) - 2.5, max(lats) + 2.5], lonaxis_range=[min(lons) - 3, max(lons) + 3])
+    return _layout(fig, 560)
 
 
 def _airport_order() -> list[str]:
